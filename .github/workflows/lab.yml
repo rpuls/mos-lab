@@ -1,0 +1,132 @@
+name: Lab
+run-name: ${{ github.event.client_payload.title || format('{0} on {1}', inputs.drill && format('drill {0}', inputs.drill) || inputs.steps, inputs.ref) }}
+
+# A throwaway My Own Suite on the runner itself, installed from one commit, then the suite's
+# own E2E against it. Norn starts it from a pull request and reports the results there;
+# starting it by hand runs the same lab on any commit or branch.
+on:
+  repository_dispatch:
+    types: [lab]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The suite commit or branch to test, for example staging
+        required: true
+      steps:
+        description: The E2E steps or @paths to run, for example @full
+        required: false
+      drill:
+        description: Or an app id, to install the commit's base on staging and drill the update onto the commit
+        required: false
+
+permissions: {}
+
+jobs:
+  # The code under test runs here as root, both MOS and its tests, so this job holds no GitHub
+  # token. Its one secret is the handout key, which fetches only what the lab hands MOS anyway:
+  # the lab bucket's keys and the lab zone's DNS token, for apps that require HTTPS.
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    permissions: {}
+    env:
+      BASE: ${{ github.event.client_payload.base }}
+      DRILL: ${{ github.event.client_payload.drill || inputs.drill }}
+      REF: ${{ github.event.client_payload.sha || inputs.ref }}
+      STEPS: ${{ github.event.client_payload.steps || inputs.steps }}
+    steps:
+      - name: Check the request
+        run: |
+          ref='^[A-Za-z0-9][A-Za-z0-9._/-]*$' app='^[a-z0-9][a-z0-9-]*$' sha='^[0-9a-f]{40}$' steps='^[@A-Za-z0-9][@A-Za-z0-9:._ -]*$'
+          [[ $REF =~ $ref ]] || { echo "::error::\"$REF\" is not a commit or branch."; exit 1; }
+          if [ -n "$DRILL" ]; then
+            [[ $DRILL =~ $app ]] || { echo "::error::\"$DRILL\" is not an app id."; exit 1; }
+            [[ -z $BASE || $BASE =~ $sha ]] || { echo "::error::\"$BASE\" is not a commit."; exit 1; }
+          else
+            [[ $STEPS =~ $steps ]] || { echo "::error::Give the E2E steps to run, or an app to drill."; exit 1; }
+          fi
+      # The run id names the lab, so Let's Encrypt's weekly limit on one name never bites.
+      - name: Fetch the lab's handouts
+        env:
+          ARES_HANDOUT_KEY: ${{ secrets.ARES_HANDOUT_KEY }}
+          RUN: ${{ github.run_id }}
+        run: |
+          curl -fsS https://agent-resources.rasmuspuls.workers.dev/handout \
+            -H "authorization: Bearer $ARES_HANDOUT_KEY" -H 'x-ares-client: mos-lab' \
+            -H 'content-type: application/json' -d "{\"names\":[\"dns01\",\"bucket\"],\"run\":\"$RUN\"}" \
+            > "$RUNNER_TEMP/handout.json"
+          node - <<'EOF'
+          const fs = require('node:fs');
+          const answer = JSON.parse(fs.readFileSync(`${process.env.RUNNER_TEMP}/handout.json`, 'utf8'));
+          if (answer.code) {
+            console.log(`::error::The broker gave no handouts: ${answer.text}`);
+            process.exit(1);
+          }
+          for (const [key, value] of Object.entries(answer.env)) {
+            if (/TOKEN|KEY/.test(key)) console.log(`::add-mask::${value}`);
+            fs.appendFileSync(process.env.GITHUB_ENV, `${key}=${value}\n`);
+          }
+          EOF
+          rm "$RUNNER_TEMP/handout.json"
+      - name: Check out the commit under test
+        uses: actions/checkout@v7
+        with:
+          repository: rpuls/my-own-suite
+          ref: ${{ env.REF }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Never cache: the change's code runs here as root and could poison what others restore.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Make room for the apps' images
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      # Kept with the results, so a lab that dies before the tests still says why.
+      - name: Install MOS
+        run: |
+          set -o pipefail
+          mkdir -p test/e2e/results
+          from=$(git rev-parse HEAD)
+          if [ -n "$DRILL" ]; then from=${BASE:-$(git merge-base origin/staging HEAD)}; fi
+          node scripts/smoke/local-lab.cjs install "$from" 2>&1 | tee test/e2e/results/lab-install.log
+      # MOS turns the distro's unattended upgrades on, and on a runner that never ran them the
+      # first run starts at once: minutes of dpkg and a kernel's initramfs under the tests.
+      # Polled, not waited on: patching systemd restarts it and drops a waiting client.
+      - name: Let MOS's first host patching finish
+        timeout-minutes: 30
+        run: |
+          units='apt-daily.service apt-daily-upgrade.service'
+          sudo systemctl start --no-block $units
+          busy() {
+            queued=$(systemctl list-jobs --no-legend $units) || return 0
+            states=$(systemctl show --property=ActiveState --value $units) || return 0
+            [ -n "$queued" ] || [[ $states == *activating* ]]
+          }
+          while busy; do sleep 10; done
+          systemctl show --property=Id,Result $units
+      - name: Run the E2E
+        run: |
+          if [ -n "$DRILL" ]; then
+            node scripts/smoke/local-lab.cjs drill "$DRILL" "$(git rev-parse HEAD)"
+          else
+            read -ra items <<< "$STEPS"
+            node scripts/smoke/local-lab.cjs run "${items[@]}"
+          fi
+      # Suite Manager says only that an app stayed unhealthy; the app's own log says why.
+      - name: Keep the app containers' logs
+        if: failure()
+        run: |
+          mkdir -p test/e2e/results/containers
+          for name in $(sudo docker ps --all --filter name=mos-app- --format '{{.Names}}'); do
+            sudo docker logs --tail 300 "$name" > "test/e2e/results/containers/$name.log" 2>&1
+          done
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: lab
+          path: test/e2e/results/
+          retention-days: 14
+          if-no-files-found: ignore
