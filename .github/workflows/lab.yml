@@ -1,5 +1,5 @@
 name: Lab
-run-name: ${{ github.event.client_payload.title || format('{0} on {1}', inputs.drill && format('drill {0}', inputs.drill) || inputs.steps, inputs.ref) }}
+run-name: "${{ github.event.client_payload.title || format('{0}{1} on {2}', inputs.drill && format('drill {0}', inputs.drill) || inputs.steps, inputs.onto && format(' with {0}', inputs.onto) || '', inputs.ref) }}"
 
 # A throwaway My Own Suite on the runner itself, installed from one commit, then the suite's
 # own E2E against it. Norn starts it from a pull request and reports the results there;
@@ -18,6 +18,9 @@ on:
       drill:
         description: Or an app id, to install the commit's base on staging and drill the update onto the commit
         required: false
+      onto:
+        description: With steps, a branch to merge the commit with first, for example staging
+        required: false
 
 permissions: {}
 
@@ -32,6 +35,7 @@ jobs:
     env:
       BASE: ${{ github.event.client_payload.base }}
       DRILL: ${{ github.event.client_payload.drill || inputs.drill }}
+      ONTO: ${{ github.event.client_payload.onto || inputs.onto }}
       REF: ${{ github.event.client_payload.sha || inputs.ref }}
       STEPS: ${{ github.event.client_payload.steps || inputs.steps }}
     steps:
@@ -39,6 +43,7 @@ jobs:
         run: |
           ref='^[A-Za-z0-9][A-Za-z0-9._/-]*$' app='^[a-z0-9][a-z0-9-]*$' sha='^[0-9a-f]{40}$' steps='^[@A-Za-z0-9][@A-Za-z0-9:._ -]*$'
           [[ $REF =~ $ref ]] || { echo "::error::\"$REF\" is not a commit or branch."; exit 1; }
+          [[ -z $ONTO || ( $ONTO =~ $ref && -z $DRILL ) ]] || { echo "::error::\"$ONTO\" is not a branch to merge a run with."; exit 1; }
           if [ -n "$DRILL" ]; then
             [[ $DRILL =~ $app ]] || { echo "::error::\"$DRILL\" is not an app id."; exit 1; }
             [[ -z $BASE || $BASE =~ $sha ]] || { echo "::error::\"$BASE\" is not a commit."; exit 1; }
@@ -75,6 +80,13 @@ jobs:
           ref: ${{ env.REF }}
           fetch-depth: 0
           persist-credentials: false
+      # The merge exists only on this runner, so MOS installs it from this checkout, as root.
+      - name: Merge the commit with the branch asked for
+        if: env.ONTO != ''
+        run: |
+          git -c user.name=lab -c user.email=lab@localhost merge --no-edit "origin/$ONTO" || { echo "::error::The commit conflicts with $ONTO."; exit 1; }
+          sudo git config --system --add safe.directory "$GITHUB_WORKSPACE"
+          echo "MOS_LOCAL_LAB_SOURCE=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       # Never cache: the change's code runs here as root and could poison what others restore.
       - uses: actions/setup-node@v7
         with:
